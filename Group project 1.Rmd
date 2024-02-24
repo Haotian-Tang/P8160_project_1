@@ -1,0 +1,251 @@
+---
+title: "Group Projects on Monte Carlo Simulation Design."
+date: "P8160 Advanced Statistical Computing "
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+require(survival)
+require(quantreg)
+require(glmnet)
+require(MASS)
+require(pROC)
+
+set.seed(2019)
+```
+
+
+
+## Project 3: Compare bootstrap methods for propensiy score matching
+
+
+**Background:** Propensity‐score matching has been widely used to estimate the effects of treatments, exposures and interventions from observational data. It is an effective way to reduce or minimize the confounding effects. An important issue, however, is how to estimate the standard error of the estimated treatment effect when a propensity‐score matching is used. Direct variance estimation is often hard. Some researchers consider the use of bootstrapping to estimate the sampling variability of treatment effects to ensure accurate inferences.  
+
+Design a simulation study to examine the performance of two bootstrap methods to estimate the sampling variability of treatment effect estimates obtained from a nearest‐neighbor propensity‐score matching. 
+Using this matching approach, a treated subject is selected at random from an observational data. This treated subject is then matched to the untreated subject whose propensity score is closest to that of the treated subject. Matching without replacement was used, so that once an untreated subject was selected for matching to a given treated subject, that untreated subject was no longer eligible for matching subsequent treated subjects.
+
+
+Estimating treatment effects. For continuous outcomes, the effect of treatment can be estimated as the difference between the mean outcome in the treated subjects in the matched sample and the mean outcome in the untreated subjects in the matched sample.  For binary outcomes, the effect of treatment can be estimated as the difference between the proportions in the treated subjects and their matched untreated subjects. 
+
+We consider two bootstrap approaches to estimate the variances of the treatment effect. 
+
+\textbf{1. the simple bootstrap:} obtain a bootstrap sample by bootstrapping matched pairs, and estimate the treatment effect from bootstrap sample.  The standard deviation of the estimated treatment effects across the B bootstrap samples is used as an estimate of the standard error of the estimated treatment effect in the original propensity‐score‐matched sample.
+
+\textbf{2. the complex bootstrap:}  the complex bootstrap attempts to incorporate two additional sources of variability compared with that addressed by the simple bootstrap: variability in estimating the propensity‐score model and variability in the formation of the propensity‐score‐matched sample. Using this approach, a bootstrap sample are drawn from the original (unmatched) observational data. From that bootstrap sample, the propensity‐score model is re-estimated, and a propensity‐score‐matched sample is re-formed using the nearest‐neighbor propensity‐score matching. The treatment effect is then estimated from the marched sample. 
+
+
+\paragraph{Your tasks:} Design a simulation study to compare the performance of the simple bootstrap and the complex bootstrap in estimating the sample variablities of the estimated treatment effects using propensity‐score matching. You can consider a linear logistic regression as the propensity model. Report your findings, and make recommendations on whether bootstrap is a suitable approach, and if so,  which bootstrap method should be used. 
+
+
+```{r}
+library(MatchIt)
+library(boot)
+library(dplyr)
+
+```
+
+# For Continuous Outcomes
+
+```{r simulate-and-match}
+# Function to simulate dataset with continuous outcomes and perform propensity-score matching
+simulate_dataset_and_match <- function() {
+  n <- 1000  # Sample size
+  X1 <- rnorm(n)  # Simulate a continuous covariate
+  X2 <- rbinom(n, 1, 0.5)  # Simulate a binary covariate
+  propensity_score <- exp(0.5 + 0.1 * X1 - 0.2 * X2) / (1 + exp(0.5 + 0.1 * X1 - 0.2 * X2))
+  T <- rbinom(n, 1, propensity_score)  # Treatment assignment based on propensity score
+  Y <- 1 + 0.5 * T + 0.3 * X1 - 0.2 * X2 + rnorm(n)  # Simulate continuous outcome
+  data <- data.frame(T = T, Y = Y, X1 = X1, X2 = X2) # Incorporate into data frame
+  
+  # Matching treated and control units based on their propensity scores
+  m.out <- matchit(T ~ X1 + X2, data = data, method = "nearest", replace = FALSE)
+  matched_data <- match.data(m.out)
+  
+  # Calculate the treatment effect as the difference in means between treated and control units
+  treatment_effect <- with(matched_data, mean(Y[T == 1]) - mean(Y[T == 0]))
+  return(list(matched_data = matched_data, treatment_effect = treatment_effect))
+}
+  
+```
+
+
+
+```{r true-variability, warning=FALSE}
+# Replicate the simulation and matching process to calculate the true variability of the treatment effect
+set.seed(123)  # Ensure reproducibility
+number_of_simulations <- 1000
+results <- replicate(number_of_simulations, simulate_dataset_and_match(), simplify = FALSE)
+treatment_effects <- sapply(results, function(x) x$treatment_effect)
+
+# Standard deviation of treatment effects from the simulations represents the true variability
+true_variability <- sd(treatment_effects)
+print(paste("True Variability:", true_variability))
+```
+
+
+
+```{r, warning=FALSE}
+# Simple Bootstrap Function for Continuous Outcomes
+simple_bootstrap <- function(matched_data, R) {
+  boot_results <- numeric(R)  # Initialize a vector to store bootstrap results
+  for (i in 1:R) {
+    # Resample matched pairs with replacement
+    sampled_indices <- sample(1:nrow(matched_data), nrow(matched_data), replace = TRUE)
+    sampled_data <- matched_data[sampled_indices, ]
+    
+    # Calculate the mean difference (treatment effect) for the bootstrap sample
+    mean_diff <- with(sampled_data, mean(Y[T == 1]) - mean(Y[T == 0]))
+    boot_results[i] <- mean_diff  # Store the result
+  }
+  # Estimate the standard error as the standard deviation of the bootstrap results
+  sd(boot_results)
+}
+
+complex_bootstrap <- function(original_data, R) {
+  boot_results <- numeric(R)  # Initialize a vector to store bootstrap results
+  for (i in 1:R) {
+    # Resample from the original data with replacement
+    sampled_data <- original_data[sample(nrow(original_data), replace = TRUE), ]
+    
+    # Re-estimate propensity scores, perform matching on the bootstrap sample
+    m.out <- matchit(T ~ X1 + X2, data = sampled_data, method = "nearest", replace = FALSE)
+    
+    # Avoid naming conflicts in the matched data
+    matched_data <- match.data(m.out, distance = "propensity_distance", weights = "matching_weights", subclass = "matching_subclass")
+    
+    # Calculate the mean difference (treatment effect) for the newly matched bootstrap sample
+    mean_diff <- with(matched_data, mean(Y[T == 1]) - mean(Y[T == 0]))
+    boot_results[i] <- mean_diff  # Store the result
+  }
+  # Estimate the standard error as the standard deviation of the bootstrap results
+  sd(boot_results)
+}
+```
+
+
+```{r run-bootstrap, warning=FALSE}
+# Perform Bootstrap Analysis for Continuous Outcomes
+set.seed(123)  # Ensure reproducibility of results
+simulation_result <- simulate_dataset_and_match()  # Simulate dataset and perform matching
+matched_data_for_bootstrap <- simulation_result$matched_data  # Extract matched data for simple bootstrap
+original_data <- simulation_result$matched_data  # For complex bootstrap, ideally use original pre-matched data
+
+R <- 1000  # Number of bootstrap replications
+
+# Run Simple Bootstrap and print the standard error
+simple_bs_se <- simple_bootstrap(matched_data_for_bootstrap, R)
+print(paste("Simple Bootstrap SE:", simple_bs_se))
+
+# Run Complex Bootstrap and print the standard error
+complex_bs_se <- complex_bootstrap(original_data, R)
+print(paste("Complex Bootstrap SE:", complex_bs_se))
+```
+
+# For Binary Outcomes
+
+
+```{r, warning=FALSE}
+# Function to simulate dataset with binary outcomes and perform propensity-score matching
+simulate_and_match_binary <- function() {
+  n <- 1000  # Number of observations
+  X1 <- rnorm(n)  # Simulate a continuous covariate
+  X2 <- rbinom(n, 1, 0.5)  # Simulate a binary covariate
+  T <- rbinom(n, 1, 0.5)  # Random treatment assignment
+  
+  # Simulate binary outcome based on treatment and covariates
+  # Outcome is binary (1 for event occurred, 0 for event did not occur)
+  Y <- ifelse(X1 + X2 - 1 + rnorm(n) + 0.5 * T > 0, 1, 0)
+  data <- data.frame(T = T, Y = Y, X1 = X1, X2 = X2)
+  
+  # Perform propensity-score matching
+  m.out <- matchit(T ~ X1 + X2, data = data, method = "nearest", replace = FALSE)
+  matched_data <- match.data(m.out)
+  
+  return(matched_data)
+}
+```
+
+```{r, warning=FALSE}
+# Function to simulate a dataset and calculate its treatment effect for binary outcomes
+simulate_binary_treatment_effect <- function() {
+  matched_data <- simulate_and_match_binary()
+  # Calculate the difference in proportions between treated and untreated groups
+  treated_proportion <- mean(matched_data$Y[matched_data$T == 1])
+  control_proportion <- mean(matched_data$Y[matched_data$T == 0])
+  return(treated_proportion - control_proportion)
+}
+
+# Calculate true variability across multiple simulated datasets
+set.seed(123)
+number_of_simulations <- 1000
+treatment_effects <- replicate(number_of_simulations, simulate_binary_treatment_effect())
+
+# True variability as the standard deviation of treatment effects
+true_variability_binary <- sd(treatment_effects)
+cat("True Variability for Binary Outcome:", true_variability_binary, "\n")
+```
+
+
+
+```{r, warning=FALSE}
+# Simple Bootstrap Function for Binary Outcomes
+simple_bootstrap_binary <- function(matched_data, R) {
+  boot_results <- numeric(R)
+  for (i in 1:R) {
+    # Resample matched pairs with replacement
+    sampled_indices <- sample(1:nrow(matched_data), nrow(matched_data), replace = TRUE)
+    sampled_data <- matched_data[sampled_indices, ]
+    
+    # Calculate the difference in proportions for the bootstrap sample
+    treated_proportion <- mean(sampled_data$Y[sampled_data$T == 1])
+    control_proportion <- mean(sampled_data$Y[sampled_data$T == 0])
+    boot_results[i] <- treated_proportion - control_proportion
+  }
+  # Estimate the standard error as the standard deviation of the bootstrap results
+  sd(boot_results)
+}
+
+# Complex Bootstrap Function for Binary Outcomes
+complex_bootstrap_binary <- function(original_data, R) {
+  boot_results <- numeric(R)
+  for (i in 1:R) {
+    # Resample from the original data with replacement
+    sampled_data <- original_data[sample(nrow(original_data), replace = TRUE), ]
+    
+    # Re-estimate propensity scores, perform matching on the bootstrap sample
+    m.out <- matchit(T ~ X1 + X2, data = sampled_data, method = "nearest", replace = FALSE)
+    matched_data <- match.data(m.out, distance = "propensity_distance", weights = "matching_weights", subclass = "matching_subclass")
+    
+    # Calculate the difference in proportions for the newly matched bootstrap sample
+    treated_proportion <- mean(matched_data$Y[matched_data$T == 1])
+    control_proportion <- mean(matched_data$Y[matched_data$T == 0])
+    boot_results[i] <- treated_proportion - control_proportion
+  }
+  # Estimate the standard error as the standard deviation of the bootstrap results
+  sd(boot_results)
+}
+
+
+# Simulate and match data
+set.seed(123)
+matched_data <- simulate_and_match_binary()
+
+# Original data for complex bootstrap
+original_data <- simulate_and_match_binary()  # Note: For complex bootstrap, use pre-matched data
+
+# Number of bootstrap replications
+R <- 1000
+
+# Run Simple Bootstrap and print the standard error
+simple_bs_se_binary <- simple_bootstrap_binary(matched_data, R)
+cat("Simple Bootstrap SE for Binary Outcome:", simple_bs_se_binary, "\n")
+
+# Run Complex Bootstrap and print the standard error
+complex_bs_se_binary <- complex_bootstrap_binary(original_data, R)
+cat("Complex Bootstrap SE for Binary Outcome:", complex_bs_se_binary, "\n")
+
+
+```
+
